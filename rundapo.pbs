@@ -1,0 +1,89 @@
+#!/bin/bash
+#PBS -N retool_dapo_qwen7b
+#PBS -A PROJECT_ACCOUNT
+#PBS -q debug
+#PBS -l select=1:system=polaris
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=home:eagle
+#PBS -l place=scatter
+#PBS -j oe
+
+set -euxo pipefail
+cd "$PBS_O_WORKDIR"
+
+# ---- modules ----
+ml use /soft/modulefiles
+ml spack-pe-base
+ml apptainer
+
+# ---- apptainer tmp/cache on local scratch ----
+export BASE_SCRATCH_DIR=/local/scratch
+export APPTAINER_TMPDIR=$BASE_SCRATCH_DIR/apptainer-tmpdir
+export APPTAINER_CACHEDIR=$BASE_SCRATCH_DIR/apptainer-cachedir
+export RAY_TMPDIR=$BASE_SCRATCH_DIR/ray
+export TMPDIR=$BASE_SCRATCH_DIR/tmp
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export VECLIB_MAXIMUM_THREADS=1
+export RAYON_NUM_THREADS=1
+mkdir -p "$APPTAINER_TMPDIR" "$APPTAINER_CACHEDIR" "$RAY_TMPDIR" "$TMPDIR"
+
+# ---- proxy (optional, if outbound net is required) ----
+export HTTP_PROXY=${HTTP_PROXY:-http://proxy.example.com:3128}
+export HTTPS_PROXY=${HTTPS_PROXY:-http://proxy.example.com:3128}
+export http_proxy=$HTTP_PROXY
+export https_proxy=$HTTPS_PROXY
+
+# ---- image paths ----
+USER_NAME=${USER_NAME:-your_user}
+PROJECT_NAME=${PROJECT_NAME:-your_project}
+VERL_SIF=/home/${USER_NAME}/verl_vllm.sif
+SANDBOX_SIF=/lus/eagle/projects/${PROJECT_NAME}/${USER_NAME}/downloads/verl/sandbox_fusion.sif
+
+# ---- start sandbox-fusion service in background ----
+echo "[1/3] Starting sandbox-fusion on 127.0.0.1:8080 ..."
+apptainer exec --fakeroot "$SANDBOX_SIF" > sandbox_fusion.log 2>&1 &
+SANDBOX_PID=$!
+
+# wait until service is up
+for i in $(seq 1 30); do
+  if curl -s http://127.0.0.1:8080/run_code \
+    -H 'Content-Type: application/json' \
+    --data-raw '{"code":"print(\"ok\")","language":"python"}' >/dev/null; then
+    echo "sandbox-fusion is up."
+    break
+  fi
+  sleep 2
+done
+
+# ---- env for DAPO ----
+export MASTER_ADDR=$(hostname)
+export MASTER_PORT=29500
+export NPROC_PER_NODE=4          # Polaris single node: 4xA100
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+
+# Optional: caches to eagle (avoid filling home)
+export HF_HOME=/eagle/${PROJECT_NAME}/${USER_NAME}/hf_home
+export TRANSFORMERS_CACHE=/eagle/${PROJECT_NAME}/${USER_NAME}/hf_cache
+export WANDB_MODE=offline
+mkdir -p "$HF_HOME" "$TRANSFORMERS_CACHE"
+
+export DATA_ROOT=/eagle/${PROJECT_NAME}/${USER_NAME}/downloads/rl_data
+
+# If your tool needs sandbox endpoint, pass it like this:
+export SANDBOX_FUSION_URL=http://127.0.0.1:8080
+
+echo "[2/3] Running verl DAPO ..."
+TRAIN_SH=/eagle/${PROJECT_NAME}/${USER_NAME}/downloads/verl/recipe/retool/run_qwen2_7b_dapo.sh
+
+# Run inside verl container (GPU enabled)
+apptainer exec --fakeroot --nv \
+  -B /home -B /eagle -B /grand -B /local/scratch \
+  "$VERL_SIF" \
+  bash "$TRAIN_SH"
+
+echo "[3/3] Cleaning up sandbox-fusion ..."
+kill $SANDBOX_PID || true
+echo "DONE"
